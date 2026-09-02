@@ -1,6 +1,6 @@
 import requests
-import json
 import os
+import sys
 import logging
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
@@ -210,8 +210,10 @@ class API:
     def _get_headers(self) -> Dict[str, str]:
         """获取请求头"""
         return {
+            "referer": f"https://{self.domain}/console/checkin",
             "origin": f"https://{self.domain}",
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
+            "content-type": "application/json;charset=UTF-8",
         }
 
     def _log(self, level: str, emoji: str, message: str, force: bool = False) -> None:
@@ -238,7 +240,7 @@ class API:
 
         try:
             if method.upper() == "POST":
-                response = self.session.post(url, headers=session_headers, data=data, timeout=(60, 120))
+                response = self.session.post(url, headers=session_headers, json=data, timeout=(60, 120))
             elif method.upper() == "GET":
                 response = self.session.get(url, headers=session_headers, timeout=(60, 120))
             else:
@@ -251,6 +253,17 @@ class API:
             return response
         except requests.exceptions.RequestException as e:
             self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误: {e}", force=True)
+            return None
+
+    def _parse_json(self, response: Optional[requests.Response]) -> Optional[Dict]:
+        """解析响应 JSON，失败时输出原始响应体"""
+        if response is None:
+            return None
+
+        try:
+            return response.json()
+        except ValueError:
+            self._log("error", LogEmoji.ERROR, f"响应不是合法 JSON，状态码 {response.status_code}。响应内容: {response.text[:500]}", force=True)
             return None
 
     def _get_checkin_data(self) -> Dict[str, str]:
@@ -271,35 +284,34 @@ class API:
             "code": CheckinStatus.FAILURE,
         }
 
-        if response:
-            data = response.json()
-            code = data.get("code", -2)
-            message = data.get("message", "无消息字段")
-            points = str(data.get("points", 0))
-
-            if code == CheckinStatus.SUCCESS.value:
-                self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points}, message : {message} }}")
-                result["code"] = CheckinStatus.SUCCESS
-                result["status"] = "签到成功"
-                result["points"] = points
-                result["message"] = message
-            elif code == CheckinStatus.REPEAT.value:
-                self._log("info", LogEmoji.REPEAT, f"{{ code : {code}, message : {message} }}", force=True)
-                result["code"] = CheckinStatus.REPEAT
-                result["status"] = "重复签到"
-                result["points"] = "0"
-                result["message"] = message
-            else:
-                self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
-                result["code"] = CheckinStatus.FAILURE
-                result["status"] = "签到失败"
-                result["points"] = "0"
-                result["message"] = message
-        else:
+        data = self._parse_json(response)
+        if data is None:
             self._log("warning", LogEmoji.WARNING, "签到失败", force=True)
+            result["message"] = "网络请求失败或响应无法解析"
+            return result
+
+        code = data.get("code", -2)
+        message = data.get("message", "无消息字段")
+        points = str(data.get("points", 0))
+
+        if code == CheckinStatus.SUCCESS.value:
+            self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points}, message : {message} }}")
+            result["code"] = CheckinStatus.SUCCESS
+            result["status"] = "签到成功"
+            result["points"] = points
+            result["message"] = message
+        elif code == CheckinStatus.REPEAT.value:
+            self._log("info", LogEmoji.REPEAT, f"{{ code : {code}, message : {message} }}", force=True)
+            result["code"] = CheckinStatus.REPEAT
+            result["status"] = "重复签到"
+            result["points"] = "0"
+            result["message"] = message
+        else:
+            self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
             result["code"] = CheckinStatus.FAILURE
             result["status"] = "签到失败"
-            result["message"] = "网络请求失败"
+            result["points"] = "0"
+            result["message"] = message
 
         return result
 
@@ -310,21 +322,21 @@ class API:
         url = self._get_full_url(self.STATUS_URL)
         response = self._make_request(url, "GET", cookies=cookies)
 
-        if response:
-            data = response.json()
-            code = data.get("code", -2)
-            left_days = data.get("data", {}).get("leftDays", None)
-
-            if left_days is not None:
-                left_days_int = int(float(left_days))
-                self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, leftDays : {left_days_int} 天}}")
-                return f"{left_days_int} 天", code
-            else:
-                self._log("info", LogEmoji.FAIL, f"{{ code : {code}, leftDays : {left_days} 天}}", force=True)
-                return "None 天", code
-        else:
+        data = self._parse_json(response)
+        if data is None:
             self._log("warning", LogEmoji.WARNING, "获取状态失败", force=True)
             return "None 天", -2
+
+        code = data.get("code", -2)
+        left_days = (data.get("data") or {}).get("leftDays", None)
+
+        if left_days is not None:
+            left_days_int = int(float(left_days))
+            self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, leftDays : {left_days_int} 天}}")
+            return f"{left_days_int} 天", code
+        else:
+            self._log("info", LogEmoji.FAIL, f"{{ code : {code}, leftDays : {left_days} 天}}", force=True)
+            return "None 天", code
 
     @log_method
     def get_points(self, cookies: str) -> Tuple[str, int]:
@@ -332,44 +344,42 @@ class API:
         url = self._get_full_url(self.POINTS_URL)
         response = self._make_request(url, "GET", cookies=cookies)
 
-        if response:
-            data = response.json()
-            code = data.get("code", -2)
-            points = data.get("points", None)
-
-            if points is not None:
-                points_int = int(float(points))
-                self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points_int} 积分}}")
-                points_str = f"{points_int} 积分"
-                points_num = points_int
-                return points_str, points_num
-            else:
-                self._log("info", LogEmoji.FAIL, f"{{ code : {code}, points : {points} 积分}}", force=True)
-                return "None 积分", 0
-        else:
+        data = self._parse_json(response)
+        if data is None:
             self._log("warning", LogEmoji.WARNING, "获取积分失败", force=True)
             return "None 积分", 0
 
+        code = data.get("code", -2)
+        points = data.get("points", None)
+
+        if points is not None:
+            points_int = int(float(points))
+            self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points_int} 积分}}")
+            return f"{points_int} 积分", points_int
+        else:
+            self._log("info", LogEmoji.FAIL, f"{{ code : {code}, points : {points} 积分}}", force=True)
+            return "None 积分", 0
+
     @log_method
-    def exchange(self, cookies: str, plan: str, required_points: int) -> str:
+    def exchange(self, cookies: str, plan: str) -> str:
         """执行兑换"""
         url = self._get_full_url(self.EXCHANGE_URL)
         response = self._make_request(url, "POST", {"planType": plan}, cookies)
 
-        if response:
-            data = response.json()
-            code = data.get("code", -2)
-            message = data.get("message", "未知错误")
-
-            if code == 0:
-                self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, message : {message} }}")
-                return f"兑换成功: {plan}"
-            else:
-                self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
-                return f"兑换失败: {message}"
-        else:
+        data = self._parse_json(response)
+        if data is None:
             self._log("warning", LogEmoji.WARNING, "兑换失败", force=True)
             return "兑换失败"
+
+        code = data.get("code", -2)
+        message = data.get("message", "未知错误")
+
+        if code == 0:
+            self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, message : {message} }}")
+            return f"兑换成功: {plan}"
+        else:
+            self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
+            return f"兑换失败: {message}"
 
 
 @dataclass()
@@ -393,12 +403,12 @@ class CheckinResult:
 class PushService:
     """推送服务"""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Optional[Config]):
         self.config = config
 
     def send(self, title: str, content: str) -> bool:
         """发送推送"""
-        if not self.config.push_key:
+        if not self.config or not self.config.push_key:
             logger.info(f"{LogEmoji.WARNING} 未设置推送密钥，跳过推送通知。")
             return False
 
@@ -465,6 +475,7 @@ class Checker:
             self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
+            result.points = checkin_result.get("points", "0")
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
 
             # 3. 获取积分
@@ -474,13 +485,17 @@ class Checker:
 
             # 4. 执行兑换
             required_points = self.config.EXCHANGE_PLANS.get(self.config.exchange_plan, 500)
-            self._log(
-                cookie_idx,
-                domain,
-                LogEmoji.EXCHANGE,
-                f"开始兑换 {self.config.exchange_plan} (需要 {required_points} 积分)",
-            )
-            result.exchange = api.exchange(cookie, self.config.exchange_plan, required_points)
+            if points_num < required_points:
+                result.exchange = f"积分不足, 未兑换 {self.config.exchange_plan}: 当前 {points_num}, 需要 {required_points}"
+                self._log(cookie_idx, domain, LogEmoji.INFO, result.exchange, force=True)
+            else:
+                self._log(
+                    cookie_idx,
+                    domain,
+                    LogEmoji.EXCHANGE,
+                    f"开始兑换 {self.config.exchange_plan} (需要 {required_points} 积分)",
+                )
+                result.exchange = api.exchange(cookie, self.config.exchange_plan)
 
         return result
 
@@ -519,8 +534,12 @@ class Checker:
 logger = init_logger()
 
 
-def main():
-    """主函数"""
+def main() -> int:
+    """主函数，返回进程退出码"""
+    config: Optional[Config] = None
+    failed = True
+    title, content = "# 脚本执行出错", ""
+
     try:
         # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
@@ -540,16 +559,22 @@ def main():
             title, content, log_content = checker.format_results()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
 
+            failed = any(result.code == CheckinStatus.FAILURE for result in checker.results)
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
-        title, content, log_content = "# 脚本执行出错", str(e), str(e)
+        title, content = "# 脚本执行出错", str(e)
 
     # 4. 发送推送
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
-    push_service = PushService(config if "config" in locals() else "")
-    push_service.send(title, content)
+    PushService(config).send(title, content)
+
+    if failed:
+        logger.error(f"{LogEmoji.ERROR} 存在签到失败的任务, 以退出码 1 结束。")
+        return 1
+
     logger.info(f"{LogEmoji.END} 签到完成")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

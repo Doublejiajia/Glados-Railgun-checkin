@@ -3,7 +3,7 @@ name: auto check
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ master, main ]
     paths-ignore:
       - 'README.md'
       - 'imgs/**'
@@ -54,6 +54,7 @@ jobs:
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
 
     - name: Keep alive
+      if: always()
       uses: liskin/gh-workflow-keepalive@v1 
         
     - name: Delete workflow runs
