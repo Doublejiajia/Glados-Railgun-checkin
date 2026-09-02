@@ -16,6 +16,7 @@ class CheckinStatus(Enum):
     SUCCESS = 0
     REPEAT = 1
     FAILURE = -2
+    NOT_APPLICABLE = -3  # 客户端判定：该 Cookie 不属于此域名，不计入失败
 
 
 class ExchangePlan(Enum):
@@ -410,7 +411,7 @@ class CheckinResult:
     days: str = "None"
     points_total: str = "None"
     exchange: str = "未兑换"
-    code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, -2: 失败
+    code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, -2: 失败, -3: 域名不适用
 
     def to_dict(self) -> Dict[str, Union[str, CheckinStatus]]:
         result_dict = asdict(self)
@@ -463,6 +464,7 @@ class Checker:
 
         for cookie_idx, cookie in enumerate(self.config.cookies_list, 1):
             logger.info(f"{LogEmoji.START} ========== 开始处理 Cookie {cookie_idx} ==========")
+            cookie_results: List[CheckinResult] = []
 
             for domain in self.config.DOMAINS:
                 task_idx += 1
@@ -470,6 +472,7 @@ class Checker:
 
                 result = self._checkin_on_domain(cookie, cookie_idx, domain)
                 self.results.append(result)
+                cookie_results.append(result)
 
                 result_message = f"结果: {result.status}"
                 if result.code == CheckinStatus.SUCCESS:
@@ -478,6 +481,21 @@ class Checker:
                     self._log(cookie_idx, domain, LogEmoji.SUCCESS, result_message, force=True)
                 else:
                     self._log(cookie_idx, domain, LogEmoji.WARNING, result_message, force=True)
+
+            self._resolve_unmatched_domains(cookie_idx, cookie_results)
+
+    def _resolve_unmatched_domains(self, cookie_idx: int, cookie_results: List[CheckinResult]) -> None:
+        """各域名的 Cookie 不通用：只要在任一域名上通过鉴权，其余域名的失败就不算故障"""
+        if all(result.code == CheckinStatus.FAILURE for result in cookie_results):
+            logger.error(f"{LogEmoji.COOKIE}[{cookie_idx}] {LogEmoji.ERROR} 该 Cookie 在所有域名上均失败, 可能已失效, 请重新获取。")
+            return
+
+        for result in cookie_results:
+            if result.code == CheckinStatus.FAILURE:
+                result.code = CheckinStatus.NOT_APPLICABLE
+                result.status = "域名不适用"
+                result.exchange = "未兑换"
+                self._log(cookie_idx, result.domain, LogEmoji.INFO, "该 Cookie 不属于此域名, 已跳过（不计入失败）", force=True)
 
     def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str) -> CheckinResult:
         result = CheckinResult(cookie_idx, domain)
@@ -527,8 +545,11 @@ class Checker:
         success_count = sum(1 for r in results if r["code"] == CheckinStatus.SUCCESS)
         repeat_count = sum(1 for r in results if r["code"] == CheckinStatus.REPEAT)
         fail_count = sum(1 for r in results if r["code"] == CheckinStatus.FAILURE)
+        skip_count = sum(1 for r in results if r["code"] == CheckinStatus.NOT_APPLICABLE)
 
         title = f"GLaDOS 签到, 成功{success_count}, 失败{fail_count}, 重复{repeat_count}"
+        if skip_count:
+            title += f", 域名不适用{skip_count}"
 
         send_content_lines = []
         log_content_lines = []
