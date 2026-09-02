@@ -1,5 +1,6 @@
 import requests
 import os
+import re
 import sys
 import logging
 from enum import Enum
@@ -115,12 +116,23 @@ class Config:
         ExchangePlan.PLAN500.value: 500,
     }
 
+    """HTTP 头值中不允许出现的控制字符"""
+    ILLEGAL_COOKIE_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
     def __init__(self):
         self.push_key: str = ""
         self.cookies_list: List[str] = []
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
         self._load_config()
+
+    @classmethod
+    def _sanitize_cookie(cls, cookie: str) -> str:
+        """清理 Cookie：控制字符会让 urllib3 拒绝整个请求头，导致请求发不出去"""
+        cleaned = cls.ILLEGAL_COOKIE_CHARS.sub("", cookie).strip()
+        if cleaned != cookie.strip():
+            logger.warning(f"{LogEmoji.WARNING} 有 Cookie 含换行等控制字符，已自动移除。若签到仍失败，请确认 '{cls.ENV_COOKIES}' 是单行文本（多账号用 & 连接）。")
+        return cleaned
 
     def _load_config(self) -> None:
         """加载配置"""
@@ -139,7 +151,7 @@ class Config:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_COOKIES}' 未设置。")
             self.cookies_list = []
         else:
-            self.cookies_list = [cookie.strip() for cookie in raw_cookies_env.split("&") if cookie.strip()]
+            self.cookies_list = [cleaned for cleaned in (self._sanitize_cookie(cookie) for cookie in raw_cookies_env.split("&")) if cleaned]
             if not self.cookies_list:
                 raise ValueError(f"环境变量 '{self.ENV_COOKIES}' 已设置，但未包含任何有效的 Cookie。")
 
@@ -158,7 +170,7 @@ class Config:
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
 
-        if verbose_env is not None:
+        if verbose_env:
             verbose_env_lower = verbose_env.lower()
             if verbose_env_lower in ["true", "1", "yes", "y"]:
                 self.verbose = True
@@ -252,8 +264,13 @@ class API:
                 return None
             return response
         except requests.exceptions.RequestException as e:
-            self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误: {e}", force=True)
+            self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误: {self._redact(str(e), cookies)}", force=True)
             return None
+
+    @staticmethod
+    def _redact(text: str, secret: str) -> str:
+        """异常信息可能带出请求头原文，抹掉其中的 Cookie"""
+        return text.replace(secret, "***") if secret else text
 
     def _parse_json(self, response: Optional[requests.Response]) -> Optional[Dict]:
         """解析响应 JSON，失败时输出原始响应体"""
