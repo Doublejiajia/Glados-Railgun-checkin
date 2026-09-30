@@ -102,6 +102,7 @@ class Config:
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
     ENV_DOMAINS = "GLADOS_DOMAINS"
+    ENV_USER_AGENT = "GLADOS_USER_AGENT"
 
     """默认兑换计划"""
     DEFAULT_EXCHANGE_PLAN = "plan500"
@@ -140,6 +141,7 @@ class Config:
         self.domains: List[str] = list(self.DOMAINS)
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
+        self.user_agent: str = ""
         self._load_config()
 
     @classmethod
@@ -220,6 +222,11 @@ class Config:
             if not self.cookies_list:
                 raise ValueError(f"环境变量 '{self.ENV_COOKIES}' 已设置，但未包含任何有效的 Cookie。")
 
+        user_agent_env: Optional[str] = os.environ.get(self.ENV_USER_AGENT)
+        if user_agent_env and user_agent_env.strip():
+            self.user_agent = user_agent_env.strip()
+            logger.info(f"{LogEmoji.SUCCESS} 使用 '{self.ENV_USER_AGENT}' 指定的请求 UA: {self.user_agent}")
+
         domains_env: Optional[str] = os.environ.get(self.ENV_DOMAINS)
         if domains_env:
             parsed_domains = self._parse_domains(domains_env)
@@ -271,10 +278,35 @@ class API:
     POINTS_URL = APIEndpoint.POINTS.value
     EXCHANGE_URL = APIEndpoint.EXCHANGE.value
 
-    def __init__(self, domain: str, cookie_index: int = 0, verbose: bool = False):
+    """签到接口会比对请求设备与登录设备，平台不一致直接判定为自动化请求（code 4 / device-mismatch）"""
+    USER_AGENTS = {
+        "Windows": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        "Linux": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        "Mac": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        "Android": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36",
+        "iOS": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+    }
+
+    DEFAULT_USER_AGENT = USER_AGENTS["Windows"]
+
+    """服务端返回的登录设备名 -> USER_AGENTS 的键"""
+    DEVICE_ALIASES = {
+        "windows": "Windows",
+        "linux": "Linux",
+        "mac": "Mac",
+        "macos": "Mac",
+        "darwin": "Mac",
+        "ios": "iOS",
+        "iphone": "iOS",
+        "ipad": "iOS",
+        "android": "Android",
+    }
+
+    def __init__(self, domain: str, cookie_index: int = 0, verbose: bool = False, user_agent: str = ""):
         self.domain: str = domain
         self.cookie_index: int = cookie_index
         self.verbose: bool = verbose
+        self.user_agent: str = user_agent or self.DEFAULT_USER_AGENT
         self.headers: Dict[str, str] = self._get_headers()
         self.session = requests.Session()
         self.session.headers.update(self.headers)
@@ -305,9 +337,39 @@ class API:
         return {
             "referer": f"https://{self.domain}/console/checkin",
             "origin": f"https://{self.domain}",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
+            "user-agent": self.user_agent,
             "content-type": "application/json;charset=UTF-8",
         }
+
+    def _set_user_agent(self, user_agent: str) -> None:
+        """切换请求 UA，同步实例头与 session 头"""
+        self.user_agent = user_agent
+        self.headers["user-agent"] = user_agent
+        self.session.headers.update({"user-agent": user_agent})
+
+    @classmethod
+    def _user_agent_for_device(cls, device: Optional[str]) -> str:
+        """按服务端给出的登录设备挑一个同平台 UA"""
+        if not device:
+            return ""
+        return cls.USER_AGENTS.get(cls.DEVICE_ALIASES.get(str(device).strip().lower(), ""), "")
+
+    def _request_json(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "") -> Optional[Dict]:
+        """请求并解析 JSON；若服务端判定设备不匹配，按它给出的登录设备换 UA 重试一次"""
+        payload = self._parse_json(self._make_request(url, method, data, cookies))
+
+        if not isinstance(payload, dict) or payload.get("reason") != "device-mismatch":
+            return payload
+
+        login_device = payload.get("loginDevice")
+        user_agent = self._user_agent_for_device(login_device)
+        if not user_agent or user_agent == self.user_agent:
+            self._log("warning", LogEmoji.WARNING, f"服务端判定设备不匹配（登录设备 {login_device}），本地没有匹配的 UA，可用 '{Config.ENV_USER_AGENT}' 显式指定", force=True)
+            return payload
+
+        self._log("warning", LogEmoji.WARNING, f"服务端判定设备不匹配（登录设备 {login_device}），已切换请求 UA 重试", force=True)
+        self._set_user_agent(user_agent)
+        return self._parse_json(self._make_request(url, method, data, cookies))
 
     def _log(self, level: str, emoji: str, message: str, force: bool = False) -> None:
         """统一日志输出方法"""
@@ -373,7 +435,7 @@ class API:
         """执行签到"""
         url = self._get_full_url(self.CHECKIN_URL)
         checkin_data = self._get_checkin_data()
-        response = self._make_request(url, "POST", checkin_data, cookies)
+        data = self._request_json(url, "POST", checkin_data, cookies)
 
         result = {
             "status": "签到失败",
@@ -382,7 +444,6 @@ class API:
             "code": CheckinStatus.FAILURE,
         }
 
-        data = self._parse_json(response)
         if data is None:
             self._log("warning", LogEmoji.WARNING, "签到失败", force=True)
             result["message"] = "网络请求失败或响应无法解析"
@@ -418,9 +479,8 @@ class API:
         """获取状态"""
 
         url = self._get_full_url(self.STATUS_URL)
-        response = self._make_request(url, "GET", cookies=cookies)
+        data = self._request_json(url, "GET", None, cookies)
 
-        data = self._parse_json(response)
         if data is None:
             self._log("warning", LogEmoji.WARNING, "获取状态失败", force=True)
             return "None 天", -2
@@ -440,9 +500,8 @@ class API:
     def get_points(self, cookies: str) -> Tuple[str, int]:
         """获取积分"""
         url = self._get_full_url(self.POINTS_URL)
-        response = self._make_request(url, "GET", cookies=cookies)
+        data = self._request_json(url, "GET", None, cookies)
 
-        data = self._parse_json(response)
         if data is None:
             self._log("warning", LogEmoji.WARNING, "获取积分失败", force=True)
             return "None 积分", 0
@@ -462,9 +521,8 @@ class API:
     def exchange(self, cookies: str, plan: str) -> str:
         """执行兑换"""
         url = self._get_full_url(self.EXCHANGE_URL)
-        response = self._make_request(url, "POST", {"planType": plan}, cookies)
+        data = self._request_json(url, "POST", {"planType": plan}, cookies)
 
-        data = self._parse_json(response)
         if data is None:
             self._log("warning", LogEmoji.WARNING, "兑换失败", force=True)
             return "兑换失败"
@@ -589,7 +647,7 @@ class Checker:
     def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str, already_completed: bool = False) -> CheckinResult:
         result = CheckinResult(cookie_idx, domain)
 
-        with API(domain, cookie_idx, verbose=self.config.verbose) as api:
+        with API(domain, cookie_idx, verbose=self.config.verbose, user_agent=self.config.user_agent) as api:
             # 1. 获取状态：同时判断该域名是否认可这份 Cookie
             self._log(cookie_idx, domain, LogEmoji.STATUS, "查询剩余天数")
             days_str, status_code = api.get_status(cookie)

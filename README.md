@@ -71,7 +71,7 @@
 
 - **2026-01**: 重构代码，添加log输出方便定位，支持新版网址，支持配置积分兑换策略。
 - **2026-04**: 优化代码逻辑，优化日志输出，支持[新版域名](https://railgun.info) ，在 GLADOS_COOKIES 中添加新版域名下的 cookies 即可使用。
-- **2026-09**: 默认域名扩展至 glados.cloud / glados.space / glados.network / railgun.info（可用 `GLADOS_DOMAINS` 覆盖）；Cookie 解析容忍折行、`cookie:` 头名与重复粘贴；同一账号只签到一次、只兑换一次；未通过鉴权的域名直接跳过，不再空发签到/积分/兑换请求；日志增加 Cookie 指纹用于核对 Secret 是否为最新；新增 `diagnose_cookie.py`。
+- **2026-09**: 默认域名扩展至 glados.cloud / glados.space / glados.network / railgun.info（可用 `GLADOS_DOMAINS` 覆盖）；Cookie 解析容忍折行、`cookie:` 头名与重复粘贴；同一账号只签到一次、只兑换一次；未通过鉴权的域名直接跳过，不再空发签到/积分/兑换请求；签到遇到 `device-mismatch`（登录设备与请求设备平台不一致）时自动切换同平台 UA 重试一次（可用 `GLADOS_USER_AGENT` 指定）；日志增加 Cookie 指纹用于核对 Secret 是否为最新；新增 `diagnose_cookie.py`。
 
 
 ## 问题排查与定位
@@ -80,6 +80,7 @@
   <img width="1684" height="844" alt="image" src="https://github.com/user-attachments/assets/45348a5f-43e4-45f5-8fdf-ce84d343b30d" />
 
 - 日志出现 `code : -2 / 没有权限 / No permission`：服务端判定未登录。这与完全不发送 Cookie 的响应一模一样，说明 Cookie 已失效或字段残缺（缺 `koa:sess` / `koa:sess.sig`），重新登录后获取最新 Cookie 更新 Secret 即可。
+- 日志出现 `code : 4 / Automated check-in detected / reason : device-mismatch`：签到接口在比对「登录设备」与「请求设备」的平台。脚本会读取响应里的 `loginDevice`，自动切成同平台 UA 重试一次；想省掉这次重试，可用 `GLADOS_USER_AGENT` secret 直接指定与登录设备一致的 UA（Linux Chrome 示例：`Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36`）。
 - 日志里的 `Cookie #N: 长度 …, 指纹 …, 字段 [...]` 用于核对本次运行实际用的是不是刚更新的 Secret：把同一 Cookie 喂给本地诊断脚本，指纹应当一致。
 - 本地诊断（只读，不触发签到）。Actions 签到失败时也会自动执行这一步，结果直接打印在日志末尾：
 
