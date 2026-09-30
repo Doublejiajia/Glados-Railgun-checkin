@@ -2,6 +2,7 @@ import requests
 import os
 import re
 import sys
+import hashlib
 import logging
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
@@ -16,7 +17,7 @@ class CheckinStatus(Enum):
     SUCCESS = 0
     REPEAT = 1
     FAILURE = -2
-    NOT_APPLICABLE = -3  # 客户端判定：该 Cookie 不属于此域名，不计入失败
+    NOT_APPLICABLE = -3  # 客户端判定：域名不适用或同账号已签到，不计入失败
 
 
 class ExchangePlan(Enum):
@@ -100,6 +101,7 @@ class Config:
     ENV_COOKIES = "GLADOS_COOKIES"
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
+    ENV_DOMAINS = "GLADOS_DOMAINS"
 
     """默认兑换计划"""
     DEFAULT_EXCHANGE_PLAN = "plan500"
@@ -107,8 +109,11 @@ class Config:
     """默认是否输出详细响应"""
     DEFAULT_VERBOSE = False
 
-    """默认域名"""
-    DOMAINS = ["glados.cloud", "railgun.info"]
+    """默认域名：各站点的 Cookie 不通用，逐站尝试才能判断 Cookie 属于哪一站"""
+    DOMAINS = ["glados.cloud", "glados.space", "glados.network", "railgun.info"]
+
+    """Cookie 中必须存在的登录态字段"""
+    REQUIRED_COOKIE_FIELDS = ("koa:sess", "koa:sess.sig")
 
     """兑换计划列表"""
     EXCHANGE_PLANS = {
@@ -120,20 +125,79 @@ class Config:
     """HTTP 头值中不允许出现的控制字符"""
     ILLEGAL_COOKIE_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
+    """多账号分隔符：换行与 & 等价"""
+    COOKIE_SEPARATORS = re.compile(r"[\r\n&]+")
+
+    """粘贴时容易连同请求头名一起复制进来"""
+    COOKIE_HEADER_PREFIX = re.compile(r"^\s*cookie\s*:\s*", re.IGNORECASE)
+
+    """去掉折行后可能出现的空字段"""
+    DUPLICATE_SEMICOLONS = re.compile(r";\s*;+")
+
     def __init__(self):
         self.push_key: str = ""
         self.cookies_list: List[str] = []
+        self.domains: List[str] = list(self.DOMAINS)
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
         self._load_config()
 
     @classmethod
     def _sanitize_cookie(cls, cookie: str) -> str:
-        """清理 Cookie：控制字符会让 urllib3 拒绝整个请求头，导致请求发不出去"""
-        cleaned = cls.ILLEGAL_COOKIE_CHARS.sub("", cookie).strip()
-        if cleaned != cookie.strip():
-            logger.warning(f"{LogEmoji.WARNING} 有 Cookie 含换行等控制字符，已自动移除。若签到仍失败，请确认 '{cls.ENV_COOKIES}' 是单行文本（多账号用 & 连接）。")
-        return cleaned
+        """清理 Cookie：控制字符会让 urllib3 拒绝整个请求头，顺带剥掉常见的粘贴污染"""
+        cleaned = cls.ILLEGAL_COOKIE_CHARS.sub("", cookie)
+        cleaned = cls.COOKIE_HEADER_PREFIX.sub("", cleaned)
+        cleaned = cls.DUPLICATE_SEMICOLONS.sub(";", cleaned)
+        return cleaned.strip()
+
+    @classmethod
+    def _split_cookies(cls, raw: str) -> List[str]:
+        """解析 Cookie：多条 Cookie 用换行 / & 分隔。
+
+        一条 Cookie 头可能因为粘贴被折成多行、每个字段一行，所以不能见到换行就切分：
+        只有同一字段名重复出现，才说明这是两条 Cookie 被粘在了一起。
+        """
+        segments = [segment for segment in (cls._sanitize_cookie(segment) for segment in cls.COOKIE_SEPARATORS.split(raw)) if segment]
+
+        cookies: List[str] = []
+        current: List[str] = []
+        current_fields: set = set()
+
+        for segment in segments:
+            fields = cls._cookie_fields(segment)
+            if current and current_fields.intersection(fields):
+                cookies.append("; ".join(current))
+                current, current_fields = [], set()
+            current.append(segment)
+            current_fields.update(fields)
+
+        if current:
+            cookies.append("; ".join(current))
+
+        # 拼接可能引入空字段（字段原本已带分号），去重避免重复签到
+        unique_cookies: List[str] = []
+        for cookie in (cls._sanitize_cookie(cookie) for cookie in cookies):
+            if cookie and cookie not in unique_cookies:
+                unique_cookies.append(cookie)
+
+        if cls.ILLEGAL_COOKIE_CHARS.search(raw):
+            logger.warning(f"{LogEmoji.WARNING} '{cls.ENV_COOKIES}' 含换行等控制字符，已按字段还原，共解析出 {len(unique_cookies)} 个 Cookie。")
+        return unique_cookies
+
+    @staticmethod
+    def _cookie_fields(cookie: str) -> List[str]:
+        """Cookie 中出现的字段名（不含值）"""
+        return [segment.split("=", 1)[0].strip() for segment in cookie.split(";") if segment.strip()]
+
+    @staticmethod
+    def _cookie_fingerprint(cookie: str) -> str:
+        """Cookie 指纹：用于核对 Actions 里生效的是否为刚更新的 Secret，不泄露原文"""
+        return hashlib.sha256(cookie.encode("utf-8")).hexdigest()[:12]
+
+    @staticmethod
+    def _parse_domains(raw: str) -> List[str]:
+        """解析域名列表：逗号或空白分隔"""
+        return [domain.strip() for domain in re.split(r"[,\s]+", raw) if domain.strip()]
 
     def _load_config(self) -> None:
         """加载配置"""
@@ -152,9 +216,18 @@ class Config:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_COOKIES}' 未设置。")
             self.cookies_list = []
         else:
-            self.cookies_list = [cleaned for cleaned in (self._sanitize_cookie(cookie) for cookie in raw_cookies_env.split("&")) if cleaned]
+            self.cookies_list = self._split_cookies(raw_cookies_env)
             if not self.cookies_list:
                 raise ValueError(f"环境变量 '{self.ENV_COOKIES}' 已设置，但未包含任何有效的 Cookie。")
+
+        domains_env: Optional[str] = os.environ.get(self.ENV_DOMAINS)
+        if domains_env:
+            parsed_domains = self._parse_domains(domains_env)
+            if parsed_domains:
+                self.domains = parsed_domains
+                logger.info(f"{LogEmoji.SUCCESS} 使用 '{self.ENV_DOMAINS}' 指定的域名: {', '.join(self.domains)}")
+            else:
+                logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_DOMAINS}' 为空，将使用默认域名。")
 
         if not exchange_plan_env:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_EXCHANGE_PLAN}' 未设置，将使用默认兑换计划 {self.DEFAULT_EXCHANGE_PLAN}。")
@@ -168,6 +241,13 @@ class Config:
                 self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
 
         logger.info(f"{LogEmoji.INFO} 共加载了 {len(self.cookies_list)} 个 Cookie 用于签到。")
+        for index, cookie in enumerate(self.cookies_list, 1):
+            fields = self._cookie_fields(cookie)
+            logger.info(f"{LogEmoji.INFO} Cookie #{index}: 长度 {len(cookie)}, 指纹 {self._cookie_fingerprint(cookie)}, 字段 [{', '.join(fields)}]")
+            missing_fields = [field for field in self.REQUIRED_COOKIE_FIELDS if field not in fields]
+            if missing_fields:
+                logger.warning(f"{LogEmoji.WARNING} Cookie #{index} 缺少字段 {missing_fields}, 该 Cookie 结构不完整, 无法通过鉴权。")
+        logger.info(f"{LogEmoji.INFO} 待尝试域名: {', '.join(self.domains)}")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
 
@@ -456,7 +536,7 @@ class Checker:
     def checkin_all(self):
         """执行所有签到任务"""
         cookie_count = len(self.config.cookies_list)
-        domain_count = len(self.config.DOMAINS)
+        domain_count = len(self.config.domains)
         total_tasks = cookie_count * domain_count
         task_idx = 0
 
@@ -465,20 +545,28 @@ class Checker:
         for cookie_idx, cookie in enumerate(self.config.cookies_list, 1):
             logger.info(f"{LogEmoji.START} ========== 开始处理 Cookie {cookie_idx} ==========")
             cookie_results: List[CheckinResult] = []
+            completed_domain: Optional[str] = None
 
-            for domain in self.config.DOMAINS:
+            for domain in self.config.domains:
                 task_idx += 1
                 logger.info(f"{LogEmoji.INFO} ----- 任务 {task_idx}/{total_tasks}: {LogEmoji.COOKIE}[{cookie_idx}] on {LogEmoji.DOMAIN}[{domain}] -----")
 
-                result = self._checkin_on_domain(cookie, cookie_idx, domain)
+                result = self._checkin_on_domain(cookie, cookie_idx, domain, completed_domain is not None)
                 self.results.append(result)
                 cookie_results.append(result)
+
+                if result.code in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT):
+                    completed_domain = domain
 
                 result_message = f"结果: {result.status}"
                 if result.code == CheckinStatus.SUCCESS:
                     if self.config.verbose:
                         result_message = f"结果: {result.status}, 获得 {result.points} 积分, 剩余 {result.days}, 总 {result.points_total}, {result.exchange}"
                     self._log(cookie_idx, domain, LogEmoji.SUCCESS, result_message, force=True)
+                elif result.code == CheckinStatus.REPEAT:
+                    self._log(cookie_idx, domain, LogEmoji.REPEAT, result_message, force=True)
+                elif result.code == CheckinStatus.NOT_APPLICABLE:
+                    self._log(cookie_idx, domain, LogEmoji.INFO, result_message, force=True)
                 else:
                     self._log(cookie_idx, domain, LogEmoji.WARNING, result_message, force=True)
 
@@ -487,7 +575,8 @@ class Checker:
     def _resolve_unmatched_domains(self, cookie_idx: int, cookie_results: List[CheckinResult]) -> None:
         """各域名的 Cookie 不通用：只要在任一域名上通过鉴权，其余域名的失败就不算故障"""
         if all(result.code == CheckinStatus.FAILURE for result in cookie_results):
-            logger.error(f"{LogEmoji.COOKIE}[{cookie_idx}] {LogEmoji.ERROR} 该 Cookie 在所有域名上均失败, 可能已失效, 请重新获取。")
+            tried = ", ".join(result.domain for result in cookie_results)
+            logger.error(f"{LogEmoji.COOKIE}[{cookie_idx}] {LogEmoji.ERROR} 该 Cookie 在 {tried} 上均返回 -2 未授权: Cookie 已失效，或不属于以上任何域名，请重新登录后获取最新 Cookie。")
             return
 
         for result in cookie_results:
@@ -497,14 +586,27 @@ class Checker:
                 result.exchange = "未兑换"
                 self._log(cookie_idx, result.domain, LogEmoji.INFO, "该 Cookie 不属于此域名, 已跳过（不计入失败）", force=True)
 
-    def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str) -> CheckinResult:
+    def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str, already_completed: bool = False) -> CheckinResult:
         result = CheckinResult(cookie_idx, domain)
 
         with API(domain, cookie_idx, verbose=self.config.verbose) as api:
-            # 1. 获取状态
+            # 1. 获取状态：同时判断该域名是否认可这份 Cookie
             self._log(cookie_idx, domain, LogEmoji.STATUS, "查询剩余天数")
             days_str, status_code = api.get_status(cookie)
             result.days = days_str
+
+            if status_code != CheckinStatus.SUCCESS.value:
+                # 保持失败语义，是否算故障由 _resolve_unmatched_domains 在整份 Cookie 的维度上判定
+                self._log(cookie_idx, domain, LogEmoji.WARNING, "该域名未通过鉴权, 不再发送签到/积分/兑换请求", force=True)
+                return result
+
+            if already_completed:
+                # glados.cloud / glados.space / glados.network 同属一个账号与积分池，重复签到与兑换没有意义
+                result.code = CheckinStatus.NOT_APPLICABLE
+                result.status = "同账号已签到"
+                result.exchange = "未兑换"
+                self._log(cookie_idx, domain, LogEmoji.INFO, "与已签到域名同属一个账号, 跳过重复签到与兑换", force=True)
+                return result
 
             # 2. 签到
             self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
@@ -549,7 +651,7 @@ class Checker:
 
         title = f"GLaDOS 签到, 成功{success_count}, 失败{fail_count}, 重复{repeat_count}"
         if skip_count:
-            title += f", 域名不适用{skip_count}"
+            title += f", 跳过{skip_count}"
 
         send_content_lines = []
         log_content_lines = []

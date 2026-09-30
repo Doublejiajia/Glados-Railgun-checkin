@@ -52,6 +52,16 @@ jobs:
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
+        GLADOS_DOMAINS: ${{ secrets.GLADOS_DOMAINS }}
+
+    # 签到失败时自动诊断：直接给出 Cookie 是否已失效、属于哪个域名
+    - name: Diagnose cookie on failure
+      if: failure()
+      continue-on-error: true
+      run: python diagnose_cookie.py
+      env:
+        GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
+        GLADOS_DOMAINS: ${{ secrets.GLADOS_DOMAINS }}
 
     - name: Keep alive
       if: always()
