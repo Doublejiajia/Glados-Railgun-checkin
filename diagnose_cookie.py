@@ -61,6 +61,7 @@ def main() -> int:
             print(f"    [!] 缺少字段 {missing} -> 结构不完整，必然鉴权失败")
 
         authed = []
+        reported_account = False
         for domain in domains:
             result = probe_status(domain, cookie)
             if "error" in result:
@@ -69,9 +70,16 @@ def main() -> int:
             data = result.get("data") or {}
             code = data.get("code")
             if code == 0:
-                left_days = (data.get("data") or {}).get("leftDays")
+                info = data.get("data") or {}
+                left_days = info.get("leftDays")
                 authed.append(domain)
                 print(f"    {domain:<16} HTTP={result['http']} code=0  [通过鉴权] leftDays={left_days}")
+                if not reported_account:
+                    reported_account = True
+                    print(f"        账号邮箱: {info.get('email') or '（响应中无 email 字段）'}")
+                    for key in ("vip", "unpaid", "port", "configureId"):
+                        if info.get(key) is not None:
+                            print(f"        {key:<10}: {info[key]}")
             else:
                 print(f"    {domain:<16} HTTP={result['http']} code={code}  {data.get('message', data)}")
 
