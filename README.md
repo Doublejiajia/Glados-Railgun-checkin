@@ -61,6 +61,7 @@
 ```shell
 │  checkin.py	# 签到脚本
 │  diagnose_cookie.py	# Cookie 本地诊断（判断 Cookie 是否失效、属于哪个域名）
+│  login.py	# 登录助手（邮箱 + 密码换新 Cookie，并显示账号邮箱）
 │
 ├─.github
 │  └─workflows
@@ -89,6 +90,15 @@
   # 或
   GLADOS_COOKIES="..." python diagnose_cookie.py
   ```
+
+- Cookie 过期、或忘了账号用的是哪个邮箱：用登录助手换一份新的（密码为交互输入，不回显；只打印到终端，不落盘）：
+
+  ```shell
+  python login.py                 # 交互式输入邮箱与密码
+  python login.py --email a@b.com # 只给邮箱
+  ```
+
+  登录成功后它会显示账号邮箱（可用来确认注册邮箱），并输出新的 Cookie 串与指纹，直接粘到 `GLADOS_COOKIES` 即可。
 
 ## 声明
 
